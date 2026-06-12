@@ -9,6 +9,7 @@ const (
 	RoleSystem    MessageRole = "system"
 	RoleUser      MessageRole = "user"
 	RoleAssistant MessageRole = "assistant"
+	RoleTool      MessageRole = "tool"
 )
 
 // PartType identifies the kind of content in a Part.
@@ -46,12 +47,16 @@ type Part struct {
 
 // Message is an ordered sequence of Parts, with metadata.
 type Message struct {
-	ID        string
-	Role      MessageRole
-	Parts     []Part
-	Timestamp time.Time
-	CostUSD   float64
-	ModelID   string
+	ID         string
+	SessionID  string
+	Role       MessageRole
+	Parts      []Part
+	Timestamp  time.Time
+	CostUSD    float64
+	ModelID    string
+	TokenIn    int
+	TokenOut   int
+	StopReason string
 }
 
 // Session represents one conversation thread.
@@ -80,31 +85,22 @@ type RevertPoint struct {
 	Diff      string
 }
 
-// PermissionAction is the disposition for a tool call.
-type PermissionAction string
-
-const (
-	PermAllow  PermissionAction = "allow"
-	PermDeny   PermissionAction = "deny"
-	PermAsk    PermissionAction = "ask"
-)
-
-// PermissionRuleset is a map of tool name → action.
-type PermissionRuleset map[string]PermissionAction
+// PermissionRuleset is a map of tool name → action ("allow", "deny", "ask").
+type PermissionRuleset map[string]string
 
 // DefaultPermissions returns a conservative deny-first ruleset.
 func DefaultPermissions() PermissionRuleset {
 	return PermissionRuleset{
-		"bash":   PermAsk,
-		"read":   PermAllow,
-		"glob":   PermAllow,
-		"grep":   PermAllow,
-		"edit":   PermAsk,
-		"write":  PermAsk,
-		"lsp":    PermAllow,
-		"mcp":    PermAsk,
-		"webfetch": PermAsk,
-		"todowrite": PermAllow,
+		"bash":     "ask",
+		"read":     "allow",
+		"glob":     "allow",
+		"grep":     "allow",
+		"edit":     "ask",
+		"write":    "ask",
+		"lsp":      "allow",
+		"mcp":      "ask",
+		"webfetch": "ask",
+		"todowrite": "allow",
 	}
 }
 

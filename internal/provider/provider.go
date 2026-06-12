@@ -1,6 +1,27 @@
 package provider
 
-import "context"
+import (
+	"context"
+	"time"
+
+	"github.com/KingImperio/oracule-cli/internal/config"
+)
+
+// New returns a provider based on the configuration.
+// Routes to the correct adapter: OpenAI-compatible, Anthropic, or Google.
+func New(cfg config.ProviderConfig) (Provider, error) {
+	switch cfg.Provider {
+	case "openai", "ollama", "groq", "together", "deepseek", "openrouter", "mistral", "codestral":
+		return newOpenAI(cfg)
+	case "anthropic", "claude":
+		return newAnthropic(cfg)
+	case "google", "gemini":
+		return newGoogle(cfg)
+	default:
+		// Default to OpenAI-compatible — covers 50+ providers.
+		return newOpenAI(cfg)
+	}
+}
 
 // Provider is the unified interface all LLM backends must implement.
 type Provider interface {
@@ -97,6 +118,7 @@ type ToolCallStart struct {
 // ToolCallEnd carries the result of a completed tool call.
 type ToolCallEnd struct {
 	ID       string
+	Name     string
 	Output   any
 	IsError  bool
 	Duration time.Duration
@@ -104,8 +126,9 @@ type ToolCallEnd struct {
 
 // StreamDone is the terminal event for a stream.
 type StreamDone struct {
-	Usage  Usage
-	CostUSD float64
+	Usage      Usage
+	CostUSD    float64
+	StopReason string // "stop", "length", "tool_calls", "content_filter", etc.
 }
 
 // ToolDef is the normalized tool definition shape.

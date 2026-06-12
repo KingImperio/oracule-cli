@@ -3,7 +3,6 @@ package memory
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -56,6 +55,19 @@ type FileSystem interface {
 	MkdirAll(path string, perm os.FileMode) error
 	Rename(oldpath, newpath string) error
 	OpenFile(name string, flag int, perm os.FileMode) (*os.File, error)
+}
+
+// osFS is a thin adapter that delegates FileSystem calls to the os package.
+type osFS struct{}
+
+func (osFS) ReadFile(name string) ([]byte, error)         { return os.ReadFile(name) }
+func (osFS) WriteFile(name string, data []byte, perm os.FileMode) error { return os.WriteFile(name, data, perm) }
+func (osFS) ReadDir(name string) ([]os.DirEntry, error)   { return os.ReadDir(name) }
+func (osFS) Stat(name string) (os.FileInfo, error)        { return os.Stat(name) }
+func (osFS) MkdirAll(path string, perm os.FileMode) error { return os.MkdirAll(path, perm) }
+func (osFS) Rename(oldpath, newpath string) error         { return os.Rename(oldpath, newpath) }
+func (osFS) OpenFile(name string, flag int, perm os.FileMode) (*os.File, error) {
+	return os.OpenFile(name, flag, perm)
 }
 
 // NewManager builds a Manager with the given config and filesystem.

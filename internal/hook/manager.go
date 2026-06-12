@@ -199,7 +199,7 @@ func (m *Manager) runHookOutput(ctx context.Context, def HookDef, payload HookPa
 	cmd.Stdin = strings.NewReader(string(data))
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("hook %q: %w: %s", def.Type, def.Command, err, string(out))
+		return nil, fmt.Errorf("hook %q: %s: %w: %s", def.Type, def.Command, err, string(out))
 	}
 	var result HookOutput
 	if err := json.Unmarshal(out, &result); err != nil {

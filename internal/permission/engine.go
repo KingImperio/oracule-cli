@@ -58,10 +58,10 @@ func Defaults() models.PermissionRuleset {
 func Merge(base, overrides models.PermissionRuleset) models.PermissionRuleset {
 	out := make(models.PermissionRuleset, len(base)+len(overrides))
 	for k, v := range base {
-		out[k] = parseAction(v)
+		out[k] = v
 	}
 	for k, v := range overrides {
-		out[k] = parseAction(v)
+		out[k] = v
 	}
 	return out
 }

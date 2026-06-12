@@ -1,16 +1,18 @@
 package agent
 
 import (
+	"bufio"
 	"context"
-	"encoding/json"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/KingImperio/oracule-cli/pkg/ctx"
 	"github.com/KingImperio/oracule-cli/pkg/models"
 	"github.com/KingImperio/oracule-cli/internal/provider"
 	"github.com/KingImperio/oracule-cli/internal/memory"
@@ -18,6 +20,13 @@ import (
 	"github.com/KingImperio/oracule-cli/internal/permission"
 	"github.com/rs/zerolog"
 )
+
+// newID returns a random hex identifier for messages and sessions.
+func newID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
 
 // LoopResult captures the terminal state of one agent loop invocation.
 type LoopResult struct {
@@ -51,7 +60,8 @@ type Agent struct {
 	Hooks       *hook.Manager
 	Perms       *permission.Engine
 	Tools       []models.ToolDefinition
-	Sessions    *SessionStore
+	Sessions    SessionStore
+	CtxRegistry *ctx.Registry
 	Logger      zerolog.Logger
 
 	mu         sync.Mutex
@@ -68,6 +78,33 @@ type SessionStore interface {
 	GetMessages(ctx context.Context, sessionID string, limit int) ([]models.Message, error)
 	CreateRevertPoint(ctx context.Context, rp models.RevertPoint) error
 	GetRevertPoint(ctx context.Context, sessionID, messageID string) (*models.RevertPoint, error)
+}
+
+// NewAgent creates a new agent with the given configuration and dependencies.
+func NewAgent(cfg models.AgentConfig, prov provider.Provider, mem *memory.Manager,
+	hooks *hook.Manager, perms *permission.Engine, tools []models.ToolDefinition,
+	sessions SessionStore, reg *ctx.Registry, logger zerolog.Logger) *Agent {
+	return &Agent{
+		Config:      cfg,
+		Provider:    prov,
+		Memory:      mem,
+		Hooks:       hooks,
+		Perms:       perms,
+		Tools:       tools,
+		Sessions:    sessions,
+		CtxRegistry: reg,
+		Logger:      logger,
+	}
+}
+
+// NewSessionID generates a deterministic session ID based on the working directory.
+func NewSessionID(workDir string) string {
+	return newID() + "-" + sanitizePath(workDir)
+}
+
+func sanitizePath(p string) string {
+	r := strings.NewReplacer("/", "_", ":", "_", "\\", "_")
+	return r.Replace(p)
 }
 
 // Run executes one agent loop for the given user prompt.
@@ -117,6 +154,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, userPrompt string, on
 
 	result := &LoopResult{SessionID: sessionID}
 	turn := 0
+	toolOnlyCount := 0
 
 	for turn < a.Config.MaxTurns {
 		turn++
@@ -134,7 +172,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, userPrompt string, on
 		stream, err := a.Provider.Stream(loopCtx, provider.StreamRequest{
 			Model:       a.Config.ModelID,
 			System:      sysPrompt,
-			Messages:    shaped,
+			Messages:    modelsToProviderMessages(shaped),
 			MaxTokens:   a.Config.MaxTokens,
 			Temperature: 0.2,
 		})
@@ -152,6 +190,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, userPrompt string, on
 		}
 
 		// --- 7. Save assistant message ---
+		assistantMsg.SessionID = sessionID
 		if err := a.Sessions.AppendMessage(ctx, *assistantMsg); err != nil {
 			a.Logger.Error().Err(err).Msg("save assistant message")
 		}
@@ -163,11 +202,23 @@ func (a *Agent) Run(ctx context.Context, sessionID string, userPrompt string, on
 			break
 		}
 
-		// --- 8. Execute tools (parallel for read-only, sequential for stateful) ---
+		// --- Doom-loop detection ---
+		hasText := strings.TrimSpace(fullText) != ""
 		if len(toolCalls) == 0 {
-			// No tool calls -> model is done.
+			toolOnlyCount = 0
 			result.Stopped = true
 			result.Reason = "end_turn"
+			break
+		}
+		if !hasText {
+			toolOnlyCount++
+		} else {
+			toolOnlyCount = 0
+		}
+		if checkDoomLoop(toolOnlyCount, hasText) {
+			a.Logger.Warn().Int("consecutive_tool_only_turns", toolOnlyCount).Msg("doom-loop detected")
+			result.Stopped = true
+			result.Reason = "doom_loop"
 			break
 		}
 
@@ -180,6 +231,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, userPrompt string, on
 		// Append a user message with all tool results.
 		resultsMsg := models.Message{
 			ID:        newID(),
+			SessionID: sessionID,
 			Role:      models.RoleUser,
 			Parts:     toolResults,
 			Timestamp: time.Now(),
@@ -189,7 +241,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, userPrompt string, on
 		if err := a.Sessions.AppendMessage(ctx, resultsMsg); err != nil {
 			a.Logger.Error().Err(err).Msg("save tool results")
 		}
-		messages = append(messages, llmMessageFromModel(assistantMsg), llmMessageFromModel(&resultsMsg))
+		messages = append(messages, *assistantMsg, resultsMsg)
 
 		// --- 9. Check PostToolUse hook stop signal ---
 		if a.Hooks != nil {
@@ -400,12 +452,15 @@ func (a *Agent) runTool(ctx context.Context, sessionID, messageID string, tc mod
 			ToolIsError: true, ToolOutput: "denied by permission rules",
 		}, nil
 	case permission.Ask:
-		// TODO: surface approval prompt to TUI and await user decision.
-		// For now, auto-deny in headless mode, auto-allow in interactive when safe.
-		if a.Config.PermissionMode == "plan" {
+		allowed, err := a.promptPermission(toolName, toolInput)
+		if err != nil || !allowed {
+			reason := "denied by user"
+			if err != nil {
+				reason = fmt.Sprintf("permission prompt error: %v", err)
+			}
 			return models.Part{
 				Type: models.PartToolResult, ToolName: toolName,
-				ToolIsError: true, ToolOutput: "denied in plan mode",
+				ToolIsError: true, ToolOutput: reason,
 			}, nil
 		}
 	}
@@ -438,11 +493,11 @@ func (a *Agent) runTool(ctx context.Context, sessionID, messageID string, tc mod
 
 	// --- PostToolUse hook ---
 	if a.Hooks != nil {
-		_, _ = a.Hooks.FirePostToolUse(ctx, hook.HookPayload{
-			SessionID:  sessionID,
-			ToolName:   toolName,
-			ToolInput:  toolInput,
-			ToolOutput: out.Output,
+		_ = a.Hooks.Fire(ctx, hook.HookPostToolUse, hook.HookPayload{
+			SessionID:   sessionID,
+			ToolName:    toolName,
+			ToolInput:   toolInput,
+			ToolOutput:  out.Output,
 			ToolIsError: resultPart.ToolIsError,
 		})
 	}
@@ -459,6 +514,17 @@ func (a *Agent) buildSystemPrompt(ctx context.Context, session *models.Session) 
 		"Operate precisely. Prefer minimal, well-tested changes.",
 		"Use tools to read files, search code, run commands, and edit the workspace.",
 		"Think step by step when tasks are ambiguous.",
+	}
+
+	// ctx ecosystem: skills, MCPs, CLIs available for this session.
+	if a.CtxRegistry != nil {
+		ss, s, m, c := a.CtxRegistry.Stats()
+		parts = append(parts, fmt.Sprintf(
+			"\n## ctx Ecosystem\nAvailable: %d skillsets, %d skills, %d MCPs, %d CLIs.\n"+
+				"Use `ctx_suggest` with a task description to find relevant skills.\n"+
+				"Use `ctx_skill_get` to load a full skill body.\n"+
+				"Use `ctx_discover` to scan for new capabilities.",
+			ss, s, m, c))
 	}
 
 	// Layer 1: project / user instructions (CLAUDE.md / AGENTS.md equivalent).
@@ -542,13 +608,14 @@ func (a *Agent) summarizeMessages(ctx context.Context, messages []models.Message
 	for _, m := range messages {
 		builder.WriteString(fmt.Sprintf("[%s] %s\n", m.Role, firstText(m)))
 	}
-	if builder.Len() > 60_000 {
-		builder.Truncate(60_000)
+	text := builder.String()
+	if len(text) > 60_000 {
+		text = text[:60_000]
 	}
 
 	resp, err := a.Provider.Complete(ctx, provider.CompleteRequest{
-		Model: a.Config.ModelID,
-		System: sysPrompt + "\n\n## Context Summary Task\n\n" + builder.String(),
+		System:   sysPrompt + "\n\n## Context Summary Task\n\n" + text,
+		Model:    a.Config.ModelID,
 		MaxTokens: 4000,
 	})
 	if err != nil {
@@ -559,9 +626,7 @@ func (a *Agent) summarizeMessages(ctx context.Context, messages []models.Message
 
 func (a *Agent) assembleMessages(history []models.Message, userPrompt string) []models.Message {
 	out := make([]models.Message, 0, len(history)+1)
-	for _, m := range history {
-		out = append(out, llmMessageFromModel(&m))
-	}
+	out = append(out, history...)
 	out = append(out, models.Message{
 		ID:        newID(),
 		Role:      models.RoleUser,
@@ -585,9 +650,107 @@ func (a *Agent) estimateCost(in, out int) float64 {
 	return 0
 }
 
-// llmMessageFromModel converts a stored Message to the provider message shape.
-func llmMessageFromModel(m *models.Message) models.Message {
-	return *m
+// llmMessageFromModel converts a stored models.Message to a provider.Message.
+func llmMessageFromModel(m *models.Message) provider.Message {
+	return provider.Message{
+		Role:    string(m.Role),
+		Content: partsToContentParts(m.Parts),
+	}
+}
+
+// partsToContentParts converts models.Part slices to provider.ContentPart slices.
+func partsToContentParts(parts []models.Part) []provider.ContentPart {
+	out := make([]provider.ContentPart, 0, len(parts))
+	for _, p := range parts {
+		switch p.Type {
+		case models.PartText:
+			out = append(out, provider.ContentPart{Type: "text", Text: p.Text})
+		case models.PartReasoning:
+			out = append(out, provider.ContentPart{Type: "reasoning", Text: p.ReasoningText})
+		case models.PartToolCall:
+			out = append(out, provider.ContentPart{
+				Type:       "tool_use",
+				ToolCallID: p.ToolCallID,
+				ToolName:   p.ToolName,
+				ToolInput:  p.ToolInput,
+			})
+		case models.PartToolResult:
+			out = append(out, provider.ContentPart{
+				Type:        "tool_result",
+				ToolCallID:  p.ToolCallID,
+				ToolName:    p.ToolName,
+				ToolOutput:  p.ToolOutput,
+				ToolIsError: p.ToolIsError,
+			})
+		}
+	}
+	return out
+}
+
+// modelsToProviderMessages converts an entire slice for provider requests.
+func modelsToProviderMessages(msgs []models.Message) []provider.Message {
+	out := make([]provider.Message, len(msgs))
+	for i, m := range msgs {
+		out[i] = llmMessageFromModel(&m)
+	}
+	return out
+}
+
+// promptPermission asks the user to approve or deny a tool call via stderr/stdin.
+func (a *Agent) promptPermission(toolName string, input map[string]any) (bool, error) {
+	mode := a.Config.PermissionMode
+	if mode == "plan" {
+		return false, nil
+	}
+
+	if mode == "bypassPermissions" || mode == "acceptEdits" {
+		return true, nil
+	}
+
+	// Non-interactive: auto-deny
+	if !isInteractive() {
+		return false, nil
+	}
+
+	inputStr := ""
+	if cmd, ok := input["command"].(string); ok {
+		inputStr = cmd
+	} else if path, ok := input["file_path"].(string); ok {
+		inputStr = path
+	}
+
+	fmt.Fprintf(os.Stderr, "\n🔐 Allow %s", toolName)
+	if inputStr != "" {
+		fmt.Fprintf(os.Stderr, " (%s)", truncate(inputStr, 120))
+	}
+	fmt.Fprintf(os.Stderr, "? [y/N] ")
+
+	scanner := bufio.NewScanner(os.Stdin)
+	if !scanner.Scan() {
+		return false, scanner.Err()
+	}
+	answer := strings.ToLower(strings.TrimSpace(scanner.Text()))
+	return answer == "y" || answer == "yes", nil
+}
+
+func isInteractive() bool {
+	info, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+// doomLoopThreshold is the max consecutive tool-only turns before aborting.
+const doomLoopThreshold = 15
+
+// checkDoomLoop returns true if the agent is in a doom-loop (repeated tool
+// calls without producing meaningful text output).
+func checkDoomLoop(toolOnlyCount int, hasText bool) bool {
+	if hasText {
+		return false
+	}
+	return toolOnlyCount >= doomLoopThreshold
 }
 
 // joinLines concatenates non-empty strings with newlines.
